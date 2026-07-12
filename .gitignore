@@ -1,0 +1,29 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Build outputs
+.next/
+out/
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.venv
+.env
+
+# Vercel
+.vercel
+
+# OS metadata
+.DS_Store
+Thumbs.db

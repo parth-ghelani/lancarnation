@@ -596,18 +596,22 @@ _HAVE_POTRACE: bool = _potrace_available()
 
 def _vectorize_with_potrace(
     alpha_masked: np.ndarray,           # (H, W) float32, 0–1
-    ink_rgb:      Tuple[int, int, int],
+    ink_rgb:      Tuple[int, int, int],  # kept for API symmetry; unused
     workdir:      str,
     k:            int,
 ) -> Optional[str]:
     """
     Vectorize an alpha mask with potrace.
 
-    The alpha mask is thresholded at _ALPHA_THRESHOLD, inverted (potrace traces
-    dark areas), and written as a PGM.  Potrace produces SVG paths; the fill
-    is recoloured from black to *ink_rgb*.
+    Each ink layer page is a screen-printing FILM POSITIVE: every ink shape
+    is rendered as solid pure BLACK on pure WHITE (paper) so that when the
+    page is output on transparency film, the ink areas block 100% of the
+    exposure light and the surrounding areas pass 100%.  This yields a
+    clean, sharp edge on the emulsion during screen exposure.
 
-    Returns the path to the SVG file, or None on any failure.
+    (The detected ink RGB is still preserved as layer metadata — used only
+    for the swatch UI and the composite preview.  The layer page itself
+    stays monochrome black-on-white.)
     """
     binary  = (alpha_masked > _ALPHA_THRESHOLD)
     # Potrace traces dark (0) pixels.  Ink=True → 0 (dark).
@@ -634,12 +638,10 @@ def _vectorize_with_potrace(
     if result.returncode != 0 or not os.path.exists(svg_path):
         return None
 
-    # Re-colour paths from potrace's default black to the actual ink colour.
-    r, g, b    = ink_rgb
-    color_hex  = f"#{r:02x}{g:02x}{b:02x}"
+    # Force all fills to solid black — film-positive convention.
     svg_text   = Path(svg_path).read_text()
     svg_text   = re.sub(
-        r'fill="#[0-9a-fA-F]{6}"', f'fill="{color_hex}"', svg_text
+        r'fill="#[0-9a-fA-F]{6}"', 'fill="#000000"', svg_text
     )
     # Remove any white/paper background rectangle that potrace might insert.
     svg_text   = re.sub(
@@ -690,12 +692,11 @@ def _create_layers(
                 ))
                 continue
 
-        # Fallback: RGBA raster — flat ink color at solved alpha, transparent bg.
+        # Fallback: RGBA raster — solid BLACK at solved alpha, transparent bg.
+        # Film-positive convention: the layer page is a light-blocking mask,
+        # not a coloured preview. Colour is stored as metadata only.
         H, W   = rgb_array.shape[:2]
         rgba   = np.zeros((H, W, 4), dtype=np.uint8)
-        rgba[..., 0] = ink_rgb[0]
-        rgba[..., 1] = ink_rgb[1]
-        rgba[..., 2] = ink_rgb[2]
         rgba[..., 3] = np.clip(alpha_masked * 255, 0, 255).astype(np.uint8)
 
         layers.append(_Layer(

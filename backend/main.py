@@ -109,8 +109,6 @@ def _run_job(
     orientation: str,
 ) -> dict:
     """Blocking: run full separation pipeline, save PDF + metadata. Returns response dict."""
-    if shutil.which("potrace") is None:
-        raise RuntimeError("potrace not installed")
 
     colors = _extract_colors(input_path, max_colors)
     color_count = len(colors)
@@ -175,11 +173,14 @@ def _validate_params(page_size: str, orientation: str) -> None:
 
 def _wrap_job_error(e: Exception) -> HTTPException:
     msg = str(e)
-    if isinstance(e, RuntimeError) and "potrace" in msg.lower():
-        return HTTPException(status_code=500, detail="potrace not installed")
     if isinstance(e, ValueError):
         return HTTPException(status_code=422, detail=msg)
     return HTTPException(status_code=500, detail=f"Separation failed: {msg}")
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "Position Print Separator"}
 
 
 @app.post("/api/separate")

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import type { GetStaticProps } from 'next'
 import Head from 'next/head'
 import Dropzone from '../components/Dropzone'
 import ColorSwatches from '../components/ColorSwatches'
@@ -6,7 +7,6 @@ import AdjustPanel from '../components/AdjustPanel'
 import ThumbnailGrid from '../components/ThumbnailGrid'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-const LAST_DEPLOY = '2026-07-13 — forced-white composite background + paper-color guard'
 
 type AppState = 'upload' | 'processing' | 'results'
 
@@ -39,7 +39,28 @@ const DEFAULT_PARAMS: Params = {
   orientation: 'auto',
 }
 
-export default function Home() {
+interface HomeProps {
+  buildTime: string
+}
+
+export const getStaticProps: GetStaticProps<HomeProps> = async () => {
+  return {
+    props: {
+      buildTime: new Date().toISOString(),
+    },
+  }
+}
+
+function formatBuildTime(iso: string): string {
+  const d = new Date(iso)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  )
+}
+
+export default function Home({ buildTime }: HomeProps) {
   const [appState, setAppState] = useState<AppState>('upload')
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [params, setParams] = useState<Params>(DEFAULT_PARAMS)
@@ -256,7 +277,7 @@ export default function Home() {
       )}
 
       <div className="deploy-footer" aria-hidden="true">
-        Last deployment update: {LAST_DEPLOY}
+        Last deployed: {formatBuildTime(buildTime)}
       </div>
 
       {appState === 'results' && currentJobId && (

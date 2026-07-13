@@ -84,6 +84,8 @@ _MIN_BLOB_AREA       = 10
 _CORE_INK_DISTANCE   = 55
 _RAW_INK_DISTANCE    = 20
 _CORNER_SAMPLE_SIZE  = 100
+_PAPER_REJECT_RGB    = 35    # RGB distance: any ink candidate closer than this to paper is dropped
+_PAPER_REJECT_LAB    = 12.0  # ΔE (LAB) distance for the same guard, perceptual
 _MARGIN_FRAC         = 0.045
 _BRACKET_ARM_FRAC    = 0.040
 _CROSSHAIR_ARM_FRAC  = 0.016
@@ -320,13 +322,22 @@ def _separate_colors(
     winner      = np.argmin(recon_errors, axis=0)
     layer_masks = [(winner == k) & clean_ink for k in range(len(ink_colors))]
 
-    # ── Filter negligible layers ─────────────────────────────────────────────
+    # ── Filter negligible layers + hard paper-color guard ────────────────────
+    # ABSOLUTE RULE: the paper/background color must NEVER be emitted as an
+    # ink layer. We reject any candidate whose color is within a tight
+    # tolerance of paper in BOTH sRGB and CIELAB perceptual space.
     min_pixels = max(150, int(0.0001 * H * W))
+    paper_lab  = _rgb_to_lab(paper)
     filtered_masks, filtered_colors = [], []
     for mask, ink in zip(layer_masks, ink_colors):
-        if int(mask.sum()) >= min_pixels:
-            filtered_masks.append(mask)
-            filtered_colors.append(ink)
+        if int(mask.sum()) < min_pixels:
+            continue
+        rgb_dist = float(np.linalg.norm(ink - paper))
+        lab_dist = float(np.linalg.norm(_rgb_to_lab(ink) - paper_lab))
+        if rgb_dist < _PAPER_REJECT_RGB or lab_dist < _PAPER_REJECT_LAB:
+            continue  # too close to paper — this IS the background
+        filtered_masks.append(mask)
+        filtered_colors.append(ink)
 
     return paper, filtered_masks, filtered_colors
 

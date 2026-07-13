@@ -71,9 +71,10 @@ def _purge_old_jobs() -> None:
 app = FastAPI(title="Position Print Separator", lifespan=lifespan)
 
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+_localhost_origins = [f"http://localhost:{p}" for p in range(3000, 3010)]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:3000"],
+    allow_origins=[FRONTEND_URL] + _localhost_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -246,10 +246,17 @@ def _rasterize_pdf_page(pdf_path: str, dpi: int = 300) -> np.ndarray:
 # are assigned to the nearest cluster centroid (in LAB) afterwards.
 _MAX_SHAPES_FOR_CLUSTERING = 500
 
-# ΔE (CIELAB Euclidean) below which two shapes are considered the same ink.
-# 30 ΔE ≈ "clearly the same color family even with gradient shading."
-# At 54 ΔE, dark-brown and terracotta are safely separated.
-_LAB_MERGE_DIST = 30.0
+# Cluster distance in scaled-LAB space where L is compressed by _L_WEIGHT
+# so that lightness variations of the same hue don't overpower true hue/chroma
+# differences.  Screen-printing intuition:
+#   • same hue at different densities = SAME ink (halftone shading)
+#   • different hue / chroma            = DIFFERENT ink
+# In raw LAB, cream (L=72,a=5,b=19) vs a rust sun (L=54,a=11,b=25) reads as
+# ΔE≈20 (mostly ΔL=18) → they merge under a coarse threshold.  Halving L's
+# contribution reduces that "false merge" while leaving true-hue distinctions
+# (navy vs yellow, brown vs orange) safely above threshold.
+_L_WEIGHT       = 0.5
+_LAB_MERGE_DIST = 15.0
 
 
 def _separate_colors(
@@ -413,6 +420,13 @@ def _discover_ink_colors_by_shapes(
     from sklearn.cluster import AgglomerativeClustering
 
     # ── 1. Per-shape representative color ────────────────────────────────────
+    # Per shape we compute the mean of its CORE pixels (those far enough from
+    # paper to be pure ink, not anti-aliased edge). This prevents the sun's
+    # true orange (~(163,90,46)) from being averaged with cream-tinted edge
+    # pixels into a muddy tan that then merges with the actual cream ink layer.
+    dist_from_paper = np.linalg.norm(arr - paper, axis=2)
+    core_mask       = dist_from_paper > _CORE_INK_DISTANCE
+
     shape_rgbs: List[np.ndarray] = []
     shape_pxns: List[int]        = []
 
@@ -421,11 +435,19 @@ def _discover_ink_colors_by_shapes(
         n_px      = int(blob_mask.sum())
         if n_px < _MIN_BLOB_AREA:
             continue
-        mean_rgb = arr[blob_mask].mean(axis=0)
+
+        core_blob = blob_mask & core_mask
+        if core_blob.sum() >= max(5, n_px // 20):
+            # Enough core pixels: use them for a clean, saturated mean.
+            shape_rgb = arr[core_blob].mean(axis=0)
+        else:
+            # Very thin stroke — no clear core. Fall back to full-shape mean.
+            shape_rgb = arr[blob_mask].mean(axis=0)
+
         # Shapes whose mean is essentially paper are background artefacts.
-        if float(np.linalg.norm(mean_rgb - paper)) < _RAW_INK_DISTANCE * 0.8:
+        if float(np.linalg.norm(shape_rgb - paper)) < _RAW_INK_DISTANCE * 0.8:
             continue
-        shape_rgbs.append(mean_rgb)
+        shape_rgbs.append(shape_rgb)
         shape_pxns.append(n_px)
 
     if not shape_rgbs:
@@ -441,8 +463,13 @@ def _discover_ink_colors_by_shapes(
     clust_rgbs = shape_rgbs[:n_clust]
     clust_pxns = shape_pxns[:n_clust]
 
-    # ── 3. Agglomerative clustering in CIELAB ────────────────────────────────
-    clust_labs = np.array([_rgb_to_lab(rgb) for rgb in clust_rgbs])  # (N, 3)
+    # ── 3. Agglomerative clustering in chroma-weighted LAB ───────────────────
+    # We scale L* by _L_WEIGHT so that lightness differences within one hue
+    # family don't dominate. Downstream code still uses the raw LAB for
+    # readability where absolute deltas matter.
+    clust_labs        = np.array([_rgb_to_lab(rgb) for rgb in clust_rgbs])
+    clust_labs_scaled = clust_labs.copy()
+    clust_labs_scaled[:, 0] *= _L_WEIGHT
 
     if n_clust == 1:
         cluster_labels = np.array([0])
@@ -454,14 +481,14 @@ def _discover_ink_colors_by_shapes(
                 metric             = "euclidean",
                 linkage            = "average",
             )
-            cluster_labels = agg.fit_predict(clust_labs)
+            cluster_labels = agg.fit_predict(clust_labs_scaled)
         except Exception:
             cluster_labels = np.zeros(n_clust, dtype=int)
 
     # ── 4. Merge excess clusters down to max_colors ──────────────────────────
     if len(set(cluster_labels)) > max_colors:
         cluster_labels = _merge_closest_clusters(
-            clust_labs, cluster_labels, max_colors
+            clust_labs_scaled, cluster_labels, max_colors
         )
 
     # Remap to contiguous 0..K-1
@@ -470,16 +497,16 @@ def _discover_ink_colors_by_shapes(
     cluster_labels = np.array([remap[l] for l in cluster_labels])
     K           = len(unique_ids)
 
-    # ── 5. Assign over-cap shapes to nearest cluster centroid (in LAB) ───────
+    # ── 5. Assign over-cap shapes to nearest cluster centroid ────────────────
     if n_shapes > n_clust:
-        # Compute cluster centroids from the shapes that were clustered
-        centroids = np.array([
-            clust_labs[cluster_labels == k].mean(axis=0) for k in range(K)
+        centroids_scaled = np.array([
+            clust_labs_scaled[cluster_labels == k].mean(axis=0) for k in range(K)
         ])
         for i in range(n_clust, n_shapes):
-            lab_i  = _rgb_to_lab(shape_rgbs[i])
-            dists  = np.linalg.norm(centroids - lab_i, axis=1)
-            assignment = int(np.argmin(dists))
+            lab_i         = _rgb_to_lab(shape_rgbs[i])
+            lab_i_scaled  = lab_i.copy(); lab_i_scaled[0] *= _L_WEIGHT
+            dists         = np.linalg.norm(centroids_scaled - lab_i_scaled, axis=1)
+            assignment    = int(np.argmin(dists))
             shape_rgbs.insert(len(clust_rgbs) + (i - n_clust), shape_rgbs[i])
             shape_pxns.insert(len(clust_pxns) + (i - n_clust), shape_pxns[i])
             cluster_labels = np.append(cluster_labels, assignment)

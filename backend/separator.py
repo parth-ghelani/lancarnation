@@ -66,11 +66,18 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 from reportlab.graphics import renderPDF
+from reportlab.lib.colors import CMYKColor
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as pdf_canvas
 from scipy import ndimage
 from svglib.svglib import svg2rlg
+
+# Rule 19 — every ink shape on a separation page uses CMYK K100 as a single
+# plate (C=0 M=0 Y=0 K=1.0), NOT DeviceRGB(0,0,0). Many RIPs convert plain
+# RGB black to rich black (100/100/100/100) which prints on all four plates
+# and produces registration issues on the screen-printer's film positive.
+_K100 = CMYKColor(0, 0, 0, 1)
 
 # Allow large print-master artwork files.
 Image.MAX_IMAGE_PIXELS = None
@@ -788,17 +795,23 @@ def _create_layers(
                 ))
                 continue
 
-        # Fallback: RGBA raster — solid BLACK at solved alpha, transparent bg.
-        # Film-positive convention: the layer page is a light-blocking mask,
-        # not a coloured preview. Colour is stored as metadata only.
+        # Fallback: CMYK raster — K=100 in ink region, K=0 elsewhere,
+        # C=M=Y=0 everywhere.  Alpha stays as a separate mask so the PDF
+        # can render transparent background.  Rule 19: film-positive on
+        # a single black plate, never rich black.
         H, W   = rgb_array.shape[:2]
-        rgba   = np.zeros((H, W, 4), dtype=np.uint8)
-        rgba[..., 3] = np.clip(alpha_masked * 255, 0, 255).astype(np.uint8)
+        k_chan = np.clip(alpha_masked * 255, 0, 255).astype(np.uint8)
+        cmyk   = np.zeros((H, W, 4), dtype=np.uint8)
+        cmyk[..., 3] = k_chan  # K = alpha
+        cmyk_img = Image.fromarray(cmyk, "CMYK")
+        # Transparency mask so blank areas of the layer stay clear on the PDF.
+        alpha_mask_img = Image.fromarray(k_chan, "L")
+        cmyk_img.putalpha(alpha_mask_img)
 
         layers.append(_Layer(
             name  = name,
             color = ink.astype(np.uint8),
-            image = Image.fromarray(rgba, "RGBA"),
+            image = cmyk_img,
         ))
 
     return layers
@@ -878,6 +891,26 @@ def _resolve_page_dimensions(
     return page_w, page_h
 
 
+def _force_cmyk_black_in_drawing(node) -> None:
+    """
+    Walk a reportlab Drawing tree and re-tag every fill / stroke as CMYK K100.
+
+    This implements Rule 19 for vector layer pages: after color isolation the
+    layer artwork must render on-press as C=0 M=0 Y=0 K=100, NOT as a DeviceRGB
+    triple that the RIP is free to interpret as rich black.
+
+    Nothing structural is modified — no path, transform, canvas, or opacity
+    change.  The mutation is limited to the colour attribute only.
+    """
+    if hasattr(node, "fillColor") and node.fillColor is not None:
+        node.fillColor = _K100
+    if hasattr(node, "strokeColor") and node.strokeColor is not None:
+        node.strokeColor = _K100
+    if hasattr(node, "contents"):
+        for child in node.contents:
+            _force_cmyk_black_in_drawing(child)
+
+
 def _build_pdf(
     layers:          List[_Layer],
     composite_image: Image.Image,
@@ -908,8 +941,13 @@ def _build_pdf(
     ax1, ay1 = fx1 - inner_pad, fy1 - inner_pad
     art_w, art_h = ax1 - ax0, ay1 - ay0
 
-    def draw_reg_marks(c: pdf_canvas.Canvas) -> None:
-        c.setStrokeColorRGB(0, 0, 0)
+    def draw_reg_marks(c: pdf_canvas.Canvas, *, cmyk: bool = False) -> None:
+        # Registration marks on ink-separation pages must also be K100 so
+        # the RIP renders them on the same plate as the ink shapes.
+        if cmyk:
+            c.setStrokeColorCMYK(0, 0, 0, 1)
+        else:
+            c.setStrokeColorRGB(0, 0, 0)
         c.setLineWidth(line_weight)
         for x, y, sx, sy in [
             (fx0, fy0, +1, +1), (fx1, fy0, -1, +1),
@@ -936,6 +974,10 @@ def _build_pdf(
         drawing = svg2rlg(svg_file)
         if drawing is None or drawing.width == 0 or drawing.height == 0:
             return
+        # Rule 19 — force every fill & stroke in the vector tree to CMYK K100.
+        # Geometry (paths, curves, canvas dims, transforms) is untouched;
+        # only the colour attribute changes.
+        _force_cmyk_black_in_drawing(drawing)
         x, y, draw_w, draw_h = art_bounds(drawing.width, drawing.height)
         scale = draw_w / drawing.width
         c.saveState()
@@ -968,12 +1010,13 @@ def _build_pdf(
     c   = pdf_canvas.Canvas(out, pagesize=(page_w, page_h))
 
     for layer in layers:
-        draw_reg_marks(c)
+        # Separation page: everything on this page is K100 (Rule 19).
+        draw_reg_marks(c, cmyk=True)
         draw_layer(c, layer)
         c.showPage()
 
-    # Composite: original artwork, all colors together.
-    draw_reg_marks(c)
+    # Composite: full-colour PREVIEW (not a production separation), stays RGB.
+    draw_reg_marks(c, cmyk=False)
     draw_image_layer(c, composite_image, transparent=False)
     c.showPage()
 

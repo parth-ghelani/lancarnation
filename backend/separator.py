@@ -400,6 +400,71 @@ def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Pixel-population color candidates (mini-batch k-means)
+# ---------------------------------------------------------------------------
+
+def _kmeans_core_pixel_candidates(
+    arr:        np.ndarray,   # (H, W, 3) float32
+    core_mask:  np.ndarray,   # (H, W) bool — pixels far from paper
+    paper:      np.ndarray,   # (3,) float32
+    k:          int = 5,
+    sample_n:   int = 12000,
+) -> Tuple[List[np.ndarray], List[int]]:
+    """
+    Discover ink-color candidates from the PIXEL distribution of core-ink
+    regions (independent of connected-component shapes).
+
+    Handles the failure mode where a distinct-coloured region is spatially
+    embedded inside a larger blob of another colour — connected components
+    treat them as one shape whose mean drowns out the small region, but
+    pixel k-means sees them as separate populations.
+
+    Returns (rgb centroid list, pixel-count-per-centroid list). Paper-close
+    centroids are dropped.
+    """
+    ys, xs = np.where(core_mask)
+    if len(ys) < 200:
+        return [], []
+
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+    except Exception:
+        return [], []
+
+    core_px = arr[ys, xs]  # (N, 3)
+
+    if len(core_px) > sample_n:
+        idx     = np.random.default_rng(0).choice(len(core_px), sample_n, replace=False)
+        core_px = core_px[idx]
+
+    k = int(min(k, max(2, len(core_px) // 200)))
+    try:
+        km = MiniBatchKMeans(
+            n_clusters=k, random_state=0, batch_size=1024, n_init=3
+        )
+        labels = km.fit_predict(core_px)
+    except Exception:
+        return [], []
+
+    out_rgbs: List[np.ndarray] = []
+    out_pxns: List[int]        = []
+    for c in range(k):
+        m       = labels == c
+        n       = int(m.sum())
+        if n < 30:
+            continue
+        centroid = core_px[m].mean(axis=0).astype(np.float32)
+        if float(np.linalg.norm(centroid - paper)) < _RAW_INK_DISTANCE * 0.8:
+            continue
+        # Scale count so k-means candidates don't dominate the shape signal
+        # in the downstream weighted-mean step — they're just SEEDS.
+        out_rgbs.append(centroid)
+        out_pxns.append(max(1, n // 4))
+
+    return out_rgbs, out_pxns
+
+
+# ---------------------------------------------------------------------------
 # Shape-based ink color discovery
 # ---------------------------------------------------------------------------
 
@@ -419,7 +484,7 @@ def _discover_ink_colors_by_shapes(
     """
     from sklearn.cluster import AgglomerativeClustering
 
-    # ── 1. Per-shape representative color ────────────────────────────────────
+    # ── 1a. Per-shape representative color (spatial candidates) ─────────────
     # Per shape we compute the mean of its CORE pixels (those far enough from
     # paper to be pure ink, not anti-aliased edge). This prevents the sun's
     # true orange (~(163,90,46)) from being averaged with cream-tinted edge
@@ -438,17 +503,48 @@ def _discover_ink_colors_by_shapes(
 
         core_blob = blob_mask & core_mask
         if core_blob.sum() >= max(5, n_px // 20):
-            # Enough core pixels: use them for a clean, saturated mean.
             shape_rgb = arr[core_blob].mean(axis=0)
         else:
-            # Very thin stroke — no clear core. Fall back to full-shape mean.
             shape_rgb = arr[blob_mask].mean(axis=0)
 
-        # Shapes whose mean is essentially paper are background artefacts.
         if float(np.linalg.norm(shape_rgb - paper)) < _RAW_INK_DISTANCE * 0.8:
             continue
         shape_rgbs.append(shape_rgb)
         shape_pxns.append(n_px)
+
+    # ── 1b. Pixel k-means on core-ink pixels (color-population candidates) ──
+    # A colour hiding INSIDE a large connected blob (e.g. a small red logo on
+    # a bigger cream shirt) contributes only a slight pull on the blob's mean
+    # and gets lost.  Directly k-means on all core-ink pixels finds it as its
+    # own centroid.
+    #
+    # We only KEEP a k-means centroid if it's meaningfully distinct from
+    # every existing shape mean (in chroma-weighted LAB, distance ≥ threshold).
+    # Otherwise it's just a gradient midpoint or a duplicate of an existing
+    # shape colour — adding it would over-split gradient designs.
+    pixel_rgbs, pixel_pxns = _kmeans_core_pixel_candidates(
+        arr, core_mask, paper
+    )
+    # A k-means centroid is only kept if it is meaningfully NOVEL — far
+    # from every existing shape mean in chroma-weighted LAB.  We use a
+    # stricter threshold (1.5×) than the intra-cluster merge distance so
+    # that gradient midpoints (which are inevitable when k-means runs on a
+    # smooth gradient) don't produce false new colours; only genuinely
+    # different populations (e.g. a small red logo hidden inside a cream
+    # blob) survive.
+    novelty_threshold = lab_merge_dist * 1.5
+    if pixel_rgbs and shape_rgbs:
+        shape_labs_scaled = np.array([_rgb_to_lab(c) for c in shape_rgbs])
+        shape_labs_scaled[:, 0] *= _L_WEIGHT
+        for prgb, pxn in zip(pixel_rgbs, pixel_pxns):
+            plab = _rgb_to_lab(prgb).copy(); plab[0] *= _L_WEIGHT
+            min_d = float(np.min(np.linalg.norm(shape_labs_scaled - plab, axis=1)))
+            if min_d >= novelty_threshold:
+                shape_rgbs.append(prgb)
+                shape_pxns.append(pxn)
+    elif pixel_rgbs:
+        shape_rgbs.extend(pixel_rgbs)
+        shape_pxns.extend(pixel_pxns)
 
     if not shape_rgbs:
         return []

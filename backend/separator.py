@@ -333,7 +333,11 @@ def _separate_colors(
     # ABSOLUTE RULE: the paper/background color must NEVER be emitted as an
     # ink layer. We reject any candidate whose color is within a tight
     # tolerance of paper in BOTH sRGB and CIELAB perceptual space.
-    min_pixels = max(150, int(0.0001 * H * W))
+    #
+    # Minimum pixel floor tuned for small distinct-colored elements (a tiny
+    # orange sun, a small blue chakra) — we DO want those to survive as
+    # their own layer.
+    min_pixels = max(30, int(0.00002 * H * W))
     paper_lab  = _rgb_to_lab(paper)
     filtered_masks, filtered_colors = [], []
     for mask, ink in zip(layer_masks, ink_colors):

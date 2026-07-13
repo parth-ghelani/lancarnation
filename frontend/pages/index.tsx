@@ -6,6 +6,7 @@ import AdjustPanel from '../components/AdjustPanel'
 import ThumbnailGrid from '../components/ThumbnailGrid'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const LAST_DEPLOY = '2026-07-13 — forced-white composite background + paper-color guard'
 
 type AppState = 'upload' | 'processing' | 'results'
 
@@ -253,6 +254,10 @@ export default function Home() {
           <div className="processing-sub">This usually takes 10–30 seconds</div>
         </main>
       )}
+
+      <div className="deploy-footer" aria-hidden="true">
+        Last deployment update: {LAST_DEPLOY}
+      </div>
 
       {appState === 'results' && currentJobId && (
         <main className="results-root">

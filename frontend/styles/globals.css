@@ -570,3 +570,15 @@ body {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
 }
+
+.deploy-footer {
+  position: fixed;
+  bottom: 8px;
+  right: 12px;
+  font-size: 11px;
+  color: #9ca3af;
+  font-family: 'Inter', system-ui, sans-serif;
+  z-index: 40;
+  pointer-events: none;
+  user-select: none;
+}

@@ -175,7 +175,14 @@ def generate_separation_pdf(
             rgb_array, paper_color, layer_masks, ink_colors, workdir
         )
 
-        composite_image = Image.fromarray(rgb_array.astype(np.uint8))
+        # ABSOLUTE RULE: the composite / preview MUST always render on a WHITE
+        # background regardless of the input's background color. Instead of
+        # displaying the raw input (which would carry a yellow/green/blue
+        # background through), we rebuild the composite by alpha-compositing
+        # each ink layer over a pure-white canvas.
+        composite_image = _build_composite_on_white(
+            rgb_array, paper_color, layer_masks, ink_colors
+        )
 
         pdf_bytes = _build_pdf(
             layers          = layers,
@@ -667,6 +674,46 @@ def _create_layers(
         ))
 
     return layers
+
+
+# ---------------------------------------------------------------------------
+# Composite on forced-white background
+# ---------------------------------------------------------------------------
+
+def _build_composite_on_white(
+    rgb_array:   np.ndarray,
+    paper_color: np.ndarray,
+    layer_masks: List[np.ndarray],
+    ink_colors:  List[np.ndarray],
+) -> Image.Image:
+    """
+    Build the composite preview on a FORCED-WHITE background.
+
+    The user's design may be uploaded with any background color (yellow, green,
+    blue, cream, etc.). Regardless of that input, the composite preview and
+    every layer page must render on pure white so the separation output is
+    press-ready.
+
+    Method:
+      • Start with a pure-white RGB canvas (255, 255, 255).
+      • For each detected ink, solve α via the alpha-blend model on the input,
+        restrict α to the winner region for that ink, and alpha-blend the flat
+        ink color onto the running canvas:
+              out = α · ink + (1 − α) · out
+        Darkest inks first (list is already sorted that way) so lighter inks
+        overlay correctly at edges.
+    """
+    H, W    = rgb_array.shape[:2]
+    canvas  = np.full((H, W, 3), 255.0, dtype=np.float32)
+    rgbf    = rgb_array.astype(np.float32)
+
+    for mask, ink in zip(layer_masks, ink_colors):
+        alpha        = _compute_ink_alpha(rgbf, paper_color, ink)
+        alpha_masked = (alpha * mask).astype(np.float32)[..., None]  # (H,W,1)
+        ink_arr      = ink.astype(np.float32).reshape(1, 1, 3)
+        canvas       = alpha_masked * ink_arr + (1.0 - alpha_masked) * canvas
+
+    return Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), "RGB")
 
 
 # ---------------------------------------------------------------------------

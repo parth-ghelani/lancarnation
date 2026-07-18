@@ -1105,6 +1105,38 @@ def _compute_gang_layout(
         current_row.append((d_idx, zw, zh))
 
     _flush()
+
+    # ── Scale-to-fit pass (per sheet) ──────────────────────────────────────
+    # The packing step sizes zones at target_row_h ≈ usable_h/2, so a single
+    # row of designs only occupies half the sheet and narrow designs leave
+    # horizontal whitespace.  Fix: compute the actual bounding box of all
+    # zones on each sheet, then scale the whole group uniformly so it fills
+    # the usable area (margins preserved, spacing scales with the layout).
+    n_sheets = max((z.sheet_idx for z in zones), default=-1) + 1
+    for si in range(n_sheets):
+        sz = [z for z in zones if z.sheet_idx == si]
+        if not sz:
+            continue
+        x0 = min(z.x       for z in sz)
+        y0 = min(z.y       for z in sz)
+        x1 = max(z.x + z.w for z in sz)
+        y1 = max(z.y + z.h for z in sz)
+        bbox_w = x1 - x0
+        bbox_h = y1 - y0
+        if bbox_w <= 0 or bbox_h <= 0:
+            continue
+        usable_w = sheet_w - 2 * margin
+        usable_h = sheet_h - 2 * margin
+        scale    = min(usable_w / bbox_w, usable_h / bbox_h)
+        # Centre the scaled group within the usable area
+        off_x = margin + (usable_w - bbox_w * scale) / 2
+        off_y = margin + (usable_h - bbox_h * scale) / 2
+        for z in sz:
+            z.x = off_x + (z.x - x0) * scale
+            z.y = off_y + (z.y - y0) * scale
+            z.w = z.w * scale
+            z.h = z.h * scale
+
     return zones
 
 

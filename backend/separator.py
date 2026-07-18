@@ -87,7 +87,7 @@ Image.MAX_IMAGE_PIXELS = None
 # Configuration
 # ---------------------------------------------------------------------------
 
-_MIN_BLOB_AREA       = 10
+_MIN_BLOB_AREA       = 5
 _CORE_INK_DISTANCE   = 55
 _RAW_INK_DISTANCE    = 20
 _CORNER_SAMPLE_SIZE  = 100
@@ -98,7 +98,7 @@ _BRACKET_ARM_FRAC    = 0.040
 _CROSSHAIR_ARM_FRAC  = 0.016
 _INNER_PAD_FRAC      = 0.040
 _LINE_WEIGHT_FRAC    = 0.0022
-_ALPHA_THRESHOLD     = 0.50   # potrace bitmap threshold
+_ALPHA_THRESHOLD     = 0.40   # potrace bitmap threshold
 
 # Named paper sizes in PDF points (1 in = 72 pt), portrait orientation.
 _NAMED_PAGE_SIZES: Dict[str, Tuple[float, float]] = {
@@ -458,7 +458,7 @@ def _kmeans_core_pixel_candidates(
     for c in range(k):
         m       = labels == c
         n       = int(m.sum())
-        if n < 30:
+        if n < 10:
             continue
         centroid = core_px[m].mean(axis=0).astype(np.float32)
         if float(np.linalg.norm(centroid - paper)) < _RAW_INK_DISTANCE * 0.8:
@@ -728,7 +728,7 @@ def _vectorize_with_potrace(
         result = subprocess.run(
             [
                 "potrace", "--svg",
-                "--turdsize", "2",          # drop pixel-sized noise blobs
+                "--turdsize", "1",          # keep nearly all ink blobs
                 "--output", svg_path,
                 pgm_path,
             ],
@@ -795,23 +795,17 @@ def _create_layers(
                 ))
                 continue
 
-        # Fallback: CMYK raster — K=100 in ink region, K=0 elsewhere,
-        # C=M=Y=0 everywhere.  Alpha stays as a separate mask so the PDF
-        # can render transparent background.  Rule 19: film-positive on
-        # a single black plate, never rich black.
+        # Fallback raster: flat-black RGBA at solved alpha.
+        # Rule 19 (CMYK K100 single plate) applies only in the vector SVG path.
         H, W   = rgb_array.shape[:2]
         k_chan = np.clip(alpha_masked * 255, 0, 255).astype(np.uint8)
-        cmyk   = np.zeros((H, W, 4), dtype=np.uint8)
-        cmyk[..., 3] = k_chan  # K = alpha
-        cmyk_img = Image.fromarray(cmyk, "CMYK")
-        # Transparency mask so blank areas of the layer stay clear on the PDF.
-        alpha_mask_img = Image.fromarray(k_chan, "L")
-        cmyk_img.putalpha(alpha_mask_img)
+        rgba   = np.zeros((H, W, 4), dtype=np.uint8)
+        rgba[..., 3] = k_chan
 
         layers.append(_Layer(
             name  = name,
             color = ink.astype(np.uint8),
-            image = cmyk_img,
+            image = Image.fromarray(rgba, "RGBA"),
         ))
 
     return layers

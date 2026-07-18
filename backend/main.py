@@ -485,8 +485,13 @@ async def download(job_id: str):
         raise HTTPException(status_code=404, detail="PDF not found")
 
     meta = json.loads((job_dir / "meta.json").read_text())
-    stem = Path(meta["original_filename"]).stem
-    filename = f"{stem}_separation.pdf"
+    if meta.get("gang_sheet"):
+        first = (meta.get("original_filenames") or ["gang_sheet"])[0]
+        stem = Path(first).stem
+        filename = f"gang_{stem}_separation.pdf"
+    else:
+        stem = Path(meta["original_filename"]).stem
+        filename = f"{stem}_separation.pdf"
 
     return FileResponse(
         str(pdf_path),

@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const API_BASE = ''  // rewrites in next.config.js proxy /api/* to the backend
 
 interface ThumbnailGridProps {
   thumbnailPaths: string[]  // paths like "/api/thumb/{job_id}/{n}"

@@ -166,7 +166,7 @@ export default function Home({ buildTime }: HomeProps) {
   }
 
   async function handleGangSheet() {
-    if (gangFiles.length < 2) return
+    if (gangFiles.length < 1) return
     setError(null)
     setAppState('processing')
     setIsRegenerating(false)
@@ -457,18 +457,16 @@ export default function Home({ buildTime }: HomeProps) {
 
                 {sharedControls}
 
-                {gangFiles.length < 2 && (
+                {gangFiles.length === 0 && (
                   <p className="gang-hint">
-                    {gangFiles.length === 0
-                      ? 'Add 2 or more designs to create a gang sheet'
-                      : 'Add one more design to continue'}
+                    Add at least 1 design — drag & drop or use the button above
                   </p>
                 )}
 
                 <button
                   className="btn-primary"
                   onClick={handleGangSheet}
-                  disabled={gangFiles.length < 2}
+                  disabled={gangFiles.length < 1}
                   type="button"
                 >
                   Generate Gang Sheet

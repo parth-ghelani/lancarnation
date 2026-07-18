@@ -75,9 +75,13 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 _localhost_origins = [f"http://localhost:{p}" for p in range(3000, 3010)]
 app.add_middleware(
     CORSMiddleware,
+    # Explicit origins (exact match) + regex covering all *.vercel.app previews
+    # so CORS never blocks regardless of which Vercel preview URL is in use.
     allow_origins=[FRONTEND_URL] + _localhost_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
 
 

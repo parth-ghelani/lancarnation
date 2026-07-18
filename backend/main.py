@@ -22,6 +22,7 @@ from separator import (
     _load_as_rgb_array,
     _separate_colors,
     generate_separation_pdf,
+    generate_gang_sheet_pdf,
 )
 
 JOBS_DIR = Path("/tmp/jobs")
@@ -85,6 +86,71 @@ def _require_job(job_id: str) -> Path:
     if not job_dir.is_dir() or not (job_dir / "meta.json").exists():
         raise HTTPException(status_code=404, detail="Job not found or expired")
     return job_dir
+
+
+def _extract_colors_gang(input_paths: List[str], max_colors: int) -> List[dict]:
+    """Quick color extraction across all designs (no vectorization) for job metadata."""
+    colors: List[dict] = []
+    for ip in input_paths:
+        with tempfile.TemporaryDirectory() as workdir:
+            rgb = _load_as_rgb_array(ip, workdir)
+            _, masks, inks = _separate_colors(rgb, max_colors=max_colors)
+        for m, ink in zip(masks, inks):
+            colors.append({
+                "hex": "#{:02x}{:02x}{:02x}".format(int(ink[0]), int(ink[1]), int(ink[2])),
+                "pixels": int(m.sum()),
+            })
+    return colors
+
+
+def _run_gang_job(
+    input_paths:        List[str],
+    job_dir:            Path,
+    original_filenames: List[str],
+    max_colors:         int,
+    sheet_size:         str,
+    orientation:        str,
+    spacing_in:         float,
+    margin_in:          float,
+) -> dict:
+    """Blocking: run full gang-sheet pipeline, save PDF + metadata. Returns response dict."""
+    colors = _extract_colors_gang(input_paths, max_colors)
+    if not colors:
+        raise ValueError("No ink colors detected in any design")
+
+    pdf_bytes, page_count = generate_gang_sheet_pdf(
+        input_paths=input_paths,
+        max_colors=max_colors,
+        sheet_size=sheet_size,
+        orientation=orientation,
+        spacing_in=spacing_in,
+        margin_in=margin_in,
+    )
+
+    (job_dir / "output.pdf").write_bytes(pdf_bytes)
+
+    meta = {
+        "job_id":             job_dir.name,
+        "gang_sheet":         True,
+        "original_filenames": original_filenames,
+        "max_colors":         max_colors,
+        "sheet_size":         sheet_size,
+        "orientation":        orientation,
+        "spacing_in":         spacing_in,
+        "margin_in":          margin_in,
+        "color_count":        len(colors),
+        "colors":             colors,
+        "page_count":         page_count,
+        "created_at":         time.time(),
+    }
+    (job_dir / "meta.json").write_text(json.dumps(meta))
+
+    return {
+        "job_id":      job_dir.name,
+        "color_count": len(colors),
+        "colors":      colors,
+        "page_count":  page_count,
+    }
 
 
 def _extract_colors(input_path: str, max_colors: int) -> List[dict]:
@@ -265,44 +331,146 @@ class RegenerateRequest(BaseModel):
     orientation: str = "auto"
 
 
-@app.post("/api/regenerate/{job_id}")
-async def regenerate(job_id: str, body: RegenerateRequest):
-    _validate_params(body.page_size, body.orientation)
+@app.post("/api/gang-sheet")
+async def gang_sheet_endpoint(
+    files:       List[UploadFile] = File(...),
+    max_colors:  int   = Form(4),
+    sheet_size:  str   = Form("auto"),
+    orientation: str   = Form("auto"),
+    spacing_in:  float = Form(0.25),
+    margin_in:   float = Form(0.40),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one design file required")
+    if len(files) > 12:
+        raise HTTPException(status_code=400, detail="Maximum 12 designs per gang sheet")
+    _validate_params(sheet_size, orientation)
 
-    old_dir = _require_job(job_id)
-    old_meta = json.loads((old_dir / "meta.json").read_text())
+    job_id  = str(uuid.uuid4())
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True)
 
-    original_ext = Path(old_meta["original_filename"]).suffix.lower()
-    original_file = old_dir / f"original{original_ext}"
-    if not original_file.exists():
-        raise HTTPException(status_code=404, detail="Original file not found in job")
+    original_filenames: List[str] = []
+    input_paths:        List[str] = []
 
-    new_id = str(uuid.uuid4())
-    new_dir = JOBS_DIR / new_id
-    new_dir.mkdir(parents=True)
-
-    new_input = new_dir / f"original{original_ext}"
-    shutil.copy(str(original_file), str(new_input))
+    for i, f in enumerate(files):
+        ext = Path(f.filename or f"upload_{i}").suffix.lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{f.filename}': unsupported type '{ext}'. Accepted: PNG, JPG, PDF, SVG",
+            )
+        content = await f.read()
+        if len(content) > MAX_FILE_SIZE:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(status_code=413, detail=f"File '{f.filename}' exceeds 24 MB limit")
+        fname = f.filename or f"design_{i}{ext}"
+        path  = job_dir / f"original_{i}{ext}"
+        path.write_bytes(content)
+        original_filenames.append(fname)
+        input_paths.append(str(path))
 
     loop = asyncio.get_running_loop()
     try:
         result = await loop.run_in_executor(
             executor,
             partial(
-                _run_job,
-                str(new_input),
-                new_dir,
-                old_meta["original_filename"],
-                body.max_colors,
-                body.page_size.lower(),
-                body.orientation.lower(),
+                _run_gang_job,
+                input_paths,
+                job_dir,
+                original_filenames,
+                max_colors,
+                sheet_size.lower(),
+                orientation.lower(),
+                spacing_in,
+                margin_in,
             ),
         )
     except Exception as e:
-        shutil.rmtree(new_dir, ignore_errors=True)
+        shutil.rmtree(job_dir, ignore_errors=True)
         raise _wrap_job_error(e)
 
     return result
+
+
+@app.post("/api/regenerate/{job_id}")
+async def regenerate(job_id: str, body: RegenerateRequest):
+    _validate_params(body.page_size, body.orientation)
+
+    old_dir  = _require_job(job_id)
+    old_meta = json.loads((old_dir / "meta.json").read_text())
+
+    new_id  = str(uuid.uuid4())
+    new_dir = JOBS_DIR / new_id
+    new_dir.mkdir(parents=True)
+
+    loop = asyncio.get_running_loop()
+
+    if old_meta.get("gang_sheet"):
+        # Gang sheet regeneration — copy all originals, re-run with new params
+        original_filenames: List[str] = old_meta["original_filenames"]
+        new_input_paths: List[str] = []
+        for i, fname in enumerate(original_filenames):
+            ext      = Path(fname).suffix.lower()
+            src      = old_dir / f"original_{i}{ext}"
+            if not src.exists():
+                shutil.rmtree(new_dir, ignore_errors=True)
+                raise HTTPException(status_code=404, detail=f"Original file {i} not found in job")
+            dst = new_dir / f"original_{i}{ext}"
+            shutil.copy(str(src), str(dst))
+            new_input_paths.append(str(dst))
+
+        try:
+            result = await loop.run_in_executor(
+                executor,
+                partial(
+                    _run_gang_job,
+                    new_input_paths,
+                    new_dir,
+                    original_filenames,
+                    body.max_colors,
+                    body.page_size.lower(),
+                    body.orientation.lower(),
+                    float(old_meta.get("spacing_in", 0.25)),
+                    float(old_meta.get("margin_in",  0.40)),
+                ),
+            )
+        except Exception as e:
+            shutil.rmtree(new_dir, ignore_errors=True)
+            raise _wrap_job_error(e)
+
+        return result
+
+    else:
+        # Single-design regeneration
+        original_ext  = Path(old_meta["original_filename"]).suffix.lower()
+        original_file = old_dir / f"original{original_ext}"
+        if not original_file.exists():
+            shutil.rmtree(new_dir, ignore_errors=True)
+            raise HTTPException(status_code=404, detail="Original file not found in job")
+
+        new_input = new_dir / f"original{original_ext}"
+        shutil.copy(str(original_file), str(new_input))
+
+        try:
+            result = await loop.run_in_executor(
+                executor,
+                partial(
+                    _run_job,
+                    str(new_input),
+                    new_dir,
+                    old_meta["original_filename"],
+                    body.max_colors,
+                    body.page_size.lower(),
+                    body.orientation.lower(),
+                ),
+            )
+        except Exception as e:
+            shutil.rmtree(new_dir, ignore_errors=True)
+            raise _wrap_job_error(e)
+
+        return result
 
 
 @app.get("/api/download/{job_id}")

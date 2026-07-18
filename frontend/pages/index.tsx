@@ -9,6 +9,7 @@ import ThumbnailGrid from '../components/ThumbnailGrid'
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 type AppState = 'upload' | 'processing' | 'results'
+type Mode = 'single' | 'gang'
 
 interface ColorInfo {
   hex: string
@@ -39,6 +40,12 @@ const DEFAULT_PARAMS: Params = {
   orientation: 'auto',
 }
 
+const SPACING_MAP: Record<string, number> = {
+  tight:  0.15,
+  normal: 0.25,
+  loose:  0.40,
+}
+
 interface HomeProps {
   buildTime: string
 }
@@ -62,7 +69,18 @@ function formatBuildTime(iso: string): string {
 
 export default function Home({ buildTime }: HomeProps) {
   const [appState, setAppState] = useState<AppState>('upload')
+  const [mode, setMode] = useState<Mode>('single')
+
+  // Single-design state
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
+
+  // Gang-sheet state
+  const [gangFiles, setGangFiles] = useState<File[]>([])
+  const [gangPreviewUrls, setGangPreviewUrls] = useState<string[]>([])
+  const [gangSpacing, setGangSpacing] = useState<string>('normal')
+  const [gangIsDragOver, setGangIsDragOver] = useState(false)
+
+  // Shared state
   const [params, setParams] = useState<Params>(DEFAULT_PARAMS)
   const [error, setError] = useState<string | null>(null)
 
@@ -73,6 +91,32 @@ export default function Home({ buildTime }: HomeProps) {
   const [colors, setColors] = useState<ColorInfo[]>([])
   const [isRegenerating, setIsRegenerating] = useState(false)
 
+  // --- Gang file helpers ---
+
+  function addGangFiles(newFiles: File[]) {
+    const urls = newFiles.map(f =>
+      f.type.startsWith('image/') ? URL.createObjectURL(f) : ''
+    )
+    setGangFiles(prev => [...prev, ...newFiles])
+    setGangPreviewUrls(prev => [...prev, ...urls])
+  }
+
+  function removeGangFile(idx: number) {
+    const url = gangPreviewUrls[idx]
+    if (url) URL.revokeObjectURL(url)
+    setGangFiles(prev => prev.filter((_, i) => i !== idx))
+    setGangPreviewUrls(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  function handleGangDrop(e: React.DragEvent) {
+    e.preventDefault()
+    setGangIsDragOver(false)
+    const dropped = Array.from(e.dataTransfer.files)
+    if (dropped.length > 0) addGangFiles(dropped)
+  }
+
+  // --- API helpers ---
+
   async function fetchPreview(jobId: string): Promise<PreviewResponse> {
     const res = await fetch(`${API_BASE}/api/preview/${jobId}`)
     if (!res.ok) {
@@ -81,6 +125,8 @@ export default function Home({ buildTime }: HomeProps) {
     }
     return res.json()
   }
+
+  // --- Handlers ---
 
   async function handleSeparate() {
     if (!selectedFile) return
@@ -110,6 +156,44 @@ export default function Home({ buildTime }: HomeProps) {
 
       setCurrentJobId(data.job_id)
       setOriginalFilename(selectedFile.name)
+      setColors(preview.colors)
+      setThumbnailPaths(preview.thumbnails)
+      setAppState('results')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Something went wrong')
+      setAppState('upload')
+    }
+  }
+
+  async function handleGangSheet() {
+    if (gangFiles.length < 2) return
+    setError(null)
+    setAppState('processing')
+    setIsRegenerating(false)
+
+    try {
+      const fd = new FormData()
+      gangFiles.forEach(f => fd.append('files', f))
+      fd.append('max_colors', String(params.max_colors))
+      fd.append('sheet_size', params.page_size)
+      fd.append('orientation', params.orientation)
+      fd.append('spacing_in', String(SPACING_MAP[gangSpacing] ?? 0.25))
+
+      const res = await fetch(`${API_BASE}/api/gang-sheet`, {
+        method: 'POST',
+        body: fd,
+      })
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.detail ?? `Gang sheet failed (${res.status})`)
+      }
+
+      const data: SeparateResponse = await res.json()
+      const preview = await fetchPreview(data.job_id)
+
+      setCurrentJobId(data.job_id)
+      setOriginalFilename(`${gangFiles.length} designs`)
       setColors(preview.colors)
       setThumbnailPaths(preview.thumbnails)
       setAppState('results')
@@ -153,8 +237,12 @@ export default function Home({ buildTime }: HomeProps) {
   }
 
   function handleStartOver() {
+    gangPreviewUrls.forEach(url => { if (url) URL.revokeObjectURL(url) })
     setAppState('upload')
     setSelectedFile(null)
+    setGangFiles([])
+    setGangPreviewUrls([])
+    setGangSpacing('normal')
     setParams(DEFAULT_PARAMS)
     setError(null)
     setCurrentJobId(null)
@@ -168,6 +256,66 @@ export default function Home({ buildTime }: HomeProps) {
     if (!currentJobId) return
     window.location.href = `${API_BASE}/api/download/${currentJobId}`
   }
+
+  // Shared controls row (Colors / Size / Orientation)
+  const sharedControls = (
+    <div className="controls-row">
+      <div className="control-group">
+        <label className="control-label" htmlFor="ctrl-colors">
+          Colors
+        </label>
+        <select
+          id="ctrl-colors"
+          className="control-select"
+          value={params.max_colors}
+          onChange={(e) =>
+            setParams((p) => ({ ...p, max_colors: Number(e.target.value) }))
+          }
+        >
+          <option value={2}>2</option>
+          <option value={3}>3</option>
+          <option value={4}>4</option>
+          <option value={5}>5</option>
+        </select>
+      </div>
+
+      <div className="control-group">
+        <label className="control-label" htmlFor="ctrl-size">
+          Size
+        </label>
+        <select
+          id="ctrl-size"
+          className="control-select"
+          value={params.page_size}
+          onChange={(e) => setParams((p) => ({ ...p, page_size: e.target.value }))}
+        >
+          <option value="auto">Auto</option>
+          <option value="a3">A3</option>
+          <option value="a4">A4</option>
+          <option value="a5">A5</option>
+          <option value="letter">Letter</option>
+          <option value="legal">Legal</option>
+          <option value="tabloid">Tabloid</option>
+        </select>
+      </div>
+
+      <div className="control-group">
+        <label className="control-label" htmlFor="ctrl-orient">
+          Orientation
+        </label>
+        <select
+          id="ctrl-orient"
+          className="control-select"
+          value={params.orientation}
+          onChange={(e) => setParams((p) => ({ ...p, orientation: e.target.value }))}
+        >
+          <option value="auto">Auto</option>
+          <option value="portrait">Portrait</option>
+          <option value="landscape">Landscape</option>
+        </select>
+      </div>
+    </div>
+  )
 
   return (
     <>
@@ -195,73 +343,138 @@ export default function Home({ buildTime }: HomeProps) {
           <div className="upload-inner">
             <h1 className="upload-title">Color Separator</h1>
 
-            <Dropzone onFileSelect={setSelectedFile} selectedFile={selectedFile} />
-
-            <div className="controls-row">
-              <div className="control-group">
-                <label className="control-label" htmlFor="up-colors">
-                  Colors
-                </label>
-                <select
-                  id="up-colors"
-                  className="control-select"
-                  value={params.max_colors}
-                  onChange={(e) =>
-                    setParams((p) => ({ ...p, max_colors: Number(e.target.value) }))
-                  }
-                >
-                  <option value={2}>2</option>
-                  <option value={3}>3</option>
-                  <option value={4}>4</option>
-                  <option value={5}>5</option>
-                </select>
-              </div>
-
-              <div className="control-group">
-                <label className="control-label" htmlFor="up-size">
-                  Size
-                </label>
-                <select
-                  id="up-size"
-                  className="control-select"
-                  value={params.page_size}
-                  onChange={(e) => setParams((p) => ({ ...p, page_size: e.target.value }))}
-                >
-                  <option value="auto">Auto</option>
-                  <option value="a3">A3</option>
-                  <option value="a4">A4</option>
-                  <option value="a5">A5</option>
-                  <option value="letter">Letter</option>
-                  <option value="legal">Legal</option>
-                  <option value="tabloid">Tabloid</option>
-                </select>
-              </div>
-
-              <div className="control-group">
-                <label className="control-label" htmlFor="up-orient">
-                  Orientation
-                </label>
-                <select
-                  id="up-orient"
-                  className="control-select"
-                  value={params.orientation}
-                  onChange={(e) => setParams((p) => ({ ...p, orientation: e.target.value }))}
-                >
-                  <option value="auto">Auto</option>
-                  <option value="portrait">Portrait</option>
-                  <option value="landscape">Landscape</option>
-                </select>
-              </div>
+            {/* Mode toggle */}
+            <div className="mode-toggle" role="group" aria-label="Separation mode">
+              <button
+                type="button"
+                className={`mode-btn${mode === 'single' ? ' mode-btn-active' : ''}`}
+                onClick={() => setMode('single')}
+              >
+                Single Design
+              </button>
+              <button
+                type="button"
+                className={`mode-btn${mode === 'gang' ? ' mode-btn-active' : ''}`}
+                onClick={() => setMode('gang')}
+              >
+                Gang Sheet
+              </button>
             </div>
 
-            <button
-              className="btn-primary"
-              onClick={handleSeparate}
-              disabled={!selectedFile}
-              type="button"
-            >
-              Separate
-            </button>
+            {mode === 'single' ? (
+              <>
+                <Dropzone onFileSelect={setSelectedFile} selectedFile={selectedFile} />
+                {sharedControls}
+                <button
+                  className="btn-primary"
+                  onClick={handleSeparate}
+                  disabled={!selectedFile}
+                  type="button"
+                >
+                  Separate
+                </button>
+              </>
+            ) : (
+              <>
+                {/* Gang dropzone — accepts drops at all times */}
+                <div
+                  className={[
+                    'gang-dropzone',
+                    gangIsDragOver ? 'drag-over' : '',
+                    gangFiles.length > 0 ? 'has-files' : '',
+                  ].filter(Boolean).join(' ')}
+                  onDrop={handleGangDrop}
+                  onDragOver={(e) => { e.preventDefault(); setGangIsDragOver(true) }}
+                  onDragLeave={() => setGangIsDragOver(false)}
+                >
+                  {gangFiles.length === 0 ? (
+                    <>
+                      <div className="dropzone-label">Drop designs here</div>
+                      <div className="dropzone-sub">
+                        PNG, JPG, PDF, SVG · max 24 MB each · or use the button below
+                      </div>
+                    </>
+                  ) : (
+                    <div className="gang-file-list">
+                      {gangFiles.map((file, idx) => (
+                        <div key={idx} className="gang-file-item">
+                          {gangPreviewUrls[idx] ? (
+                            <img
+                              src={gangPreviewUrls[idx]}
+                              alt=""
+                              className="gang-thumb"
+                            />
+                          ) : (
+                            <SmallFileIcon />
+                          )}
+                          <span className="gang-file-name">{file.name}</span>
+                          <button
+                            type="button"
+                            className="gang-remove-btn"
+                            onClick={() => removeGangFile(idx)}
+                            aria-label={`Remove ${file.name}`}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Gang secondary controls: add button + spacing */}
+                <div className="gang-controls-row">
+                  <label className="btn-add-design">
+                    + Add design
+                    <input
+                      type="file"
+                      multiple
+                      accept=".png,.jpg,.jpeg,.pdf,.svg"
+                      className="sr-only"
+                      onChange={(e) => {
+                        if (e.target.files) addGangFiles(Array.from(e.target.files))
+                        e.target.value = ''
+                      }}
+                    />
+                  </label>
+
+                  <div className="control-group" style={{ maxWidth: 140 }}>
+                    <label className="control-label" htmlFor="gang-spacing">
+                      Spacing
+                    </label>
+                    <select
+                      id="gang-spacing"
+                      className="control-select"
+                      value={gangSpacing}
+                      onChange={(e) => setGangSpacing(e.target.value)}
+                    >
+                      <option value="tight">Tight</option>
+                      <option value="normal">Normal</option>
+                      <option value="loose">Loose</option>
+                    </select>
+                  </div>
+                </div>
+
+                {sharedControls}
+
+                {gangFiles.length < 2 && (
+                  <p className="gang-hint">
+                    {gangFiles.length === 0
+                      ? 'Add 2 or more designs to create a gang sheet'
+                      : 'Add one more design to continue'}
+                  </p>
+                )}
+
+                <button
+                  className="btn-primary"
+                  onClick={handleGangSheet}
+                  disabled={gangFiles.length < 2}
+                  type="button"
+                >
+                  Generate Gang Sheet
+                </button>
+              </>
+            )}
           </div>
         </main>
       )}
@@ -316,6 +529,23 @@ export default function Home({ buildTime }: HomeProps) {
         </main>
       )}
     </>
+  )
+}
+
+function SmallFileIcon() {
+  return (
+    <div className="gang-file-icon">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" aria-hidden="true">
+        <path
+          d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"
+          stroke="#888"
+          strokeWidth="1.5"
+          fill="none"
+          strokeLinejoin="round"
+        />
+        <path d="M13 2v7h7" stroke="#aaa" strokeWidth="1.5" strokeLinejoin="round" />
+      </svg>
+    </div>
   )
 }
 

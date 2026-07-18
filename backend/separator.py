@@ -1025,6 +1025,296 @@ def _build_pdf(
 
 
 # ---------------------------------------------------------------------------
+# Gang sheet layout — data + helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _GangZone:
+    """Position and size of one design's zone on a gang-sheet page."""
+    design_idx: int
+    sheet_idx:  int
+    x:          float   # left edge, PDF points from page left
+    y:          float   # bottom edge, PDF points from page bottom
+    w:          float
+    h:          float
+
+
+def _compute_gang_layout(
+    design_sizes: List[Tuple[int, int]],  # (pixel_W, pixel_H) per design
+    sheet_w:      float,
+    sheet_h:      float,
+    margin:       float,
+    spacing:      float,
+) -> List[_GangZone]:
+    """
+    Row-based bin-pack designs onto sheets.
+
+    Each design's zone preserves its native aspect ratio. Row height equals the
+    tallest zone in that row.  Rows wrap when the next zone would exceed the
+    usable sheet width.  When a new row does not fit on the current sheet a new
+    sheet (page group) is started.  Zone positions are computed once and reused
+    identically on every layer page of the same sheet — this is what makes
+    screen registration work in production.
+    """
+    usable_w      = sheet_w - 2 * margin
+    usable_h      = sheet_h - 2 * margin
+    # Target ~2 rows per sheet; never smaller than 1 inch
+    target_row_h  = max((usable_h - spacing) / 2.0, inch)
+
+    zone_dims: List[Tuple[float, float]] = []
+    for pw, ph in design_sizes:
+        aspect = pw / max(float(ph), 1.0)
+        zh     = min(target_row_h, usable_h)
+        zw     = zh * aspect
+        if zw > usable_w:
+            zw = usable_w
+            zh = zw / max(aspect, 0.01)
+        zone_dims.append((float(zw), float(zh)))
+
+    zones:        List[_GangZone]                = []
+    sheet_idx     = 0
+    row_top       = sheet_h - margin             # PDF y of current row's top edge
+    current_row:  List[Tuple[int, float, float]] = []   # (d_idx, zw, zh)
+
+    def _row_used_w() -> float:
+        if not current_row:
+            return 0.0
+        return sum(z[1] for z in current_row) + spacing * (len(current_row) - 1)
+
+    def _flush() -> None:
+        nonlocal row_top
+        if not current_row:
+            return
+        row_h = max(z[2] for z in current_row)
+        rx    = margin
+        for di, zw, zh in current_row:
+            zones.append(_GangZone(
+                design_idx=di, sheet_idx=sheet_idx,
+                x=rx, y=row_top - row_h, w=zw, h=row_h,
+            ))
+            rx += zw + spacing
+        row_top -= row_h + spacing
+        current_row.clear()
+
+    for d_idx, (zw, zh) in enumerate(zone_dims):
+        if current_row and margin + _row_used_w() + spacing + zw > sheet_w - margin + 0.5:
+            _flush()
+            if row_top - zh < margin - 0.5:
+                sheet_idx += 1
+                row_top    = sheet_h - margin
+        current_row.append((d_idx, zw, zh))
+
+    _flush()
+    return zones
+
+
+def _draw_zone_reg_marks(c: pdf_canvas.Canvas, zone: _GangZone, *, cmyk: bool) -> None:
+    """Per-zone corner brackets and crosshair registration marks."""
+    if cmyk:
+        c.setStrokeColorCMYK(0, 0, 0, 1)
+    else:
+        c.setStrokeColorRGB(0, 0, 0)
+    zs  = min(zone.w, zone.h)
+    arm = _BRACKET_ARM_FRAC   * zs
+    crs = _CROSSHAIR_ARM_FRAC * zs
+    lw  = _LINE_WEIGHT_FRAC   * zs
+    c.setLineWidth(lw)
+    x0, y0 = zone.x,          zone.y
+    x1, y1 = zone.x + zone.w, zone.y + zone.h
+    for x, y, sx, sy in [(x0, y0, +1, +1), (x1, y0, -1, +1),
+                          (x0, y1, +1, -1), (x1, y1, -1, -1)]:
+        c.line(x, y, x + sx * arm, y)
+        c.line(x, y, x, y + sy * arm)
+    mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+    for px, py in [(mx, y0), (mx, y1), (x0, my), (x1, my)]:
+        c.line(px - crs, py, px + crs, py)
+        c.line(px, py - crs, px, py + crs)
+        c.circle(px, py, crs * 0.55, stroke=1, fill=0)
+
+
+def _fit_in_zone(
+    zone: _GangZone, native_w: float, native_h: float
+) -> Tuple[float, float, float, float]:
+    """Return (x, y, draw_w, draw_h) centred inside zone's inner artwork area."""
+    pad   = _INNER_PAD_FRAC * min(zone.w, zone.h)
+    aw    = zone.w - 2 * pad
+    ah    = zone.h - 2 * pad
+    scale = min(aw / native_w, ah / native_h)
+    dw    = native_w * scale
+    dh    = native_h * scale
+    x     = zone.x + pad + (aw - dw) / 2
+    y     = zone.y + pad + (ah - dh) / 2
+    return x, y, dw, dh
+
+
+def _draw_svg_in_zone(c: pdf_canvas.Canvas, svg_file: str, zone: _GangZone) -> None:
+    drawing = svg2rlg(svg_file)
+    if drawing is None or drawing.width == 0 or drawing.height == 0:
+        return
+    _force_cmyk_black_in_drawing(drawing)
+    x, y, dw, dh = _fit_in_zone(zone, drawing.width, drawing.height)
+    scale = dw / drawing.width
+    c.saveState()
+    c.translate(x, y)
+    c.scale(scale, scale)
+    renderPDF.draw(drawing, c, 0, 0)
+    c.restoreState()
+
+
+def _draw_raster_in_zone(
+    c: pdf_canvas.Canvas, img: Image.Image, zone: _GangZone, *, transparent: bool = False
+) -> None:
+    iw, ih = img.size
+    x, y, dw, dh = _fit_in_zone(zone, iw, ih)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    kwargs = {"mask": "auto"} if transparent else {}
+    c.drawImage(ImageReader(buf), x, y, dw, dh, **kwargs)
+
+
+def _draw_layer_in_zone(c: pdf_canvas.Canvas, layer: _Layer, zone: _GangZone) -> None:
+    if layer.svg_path:
+        _draw_svg_in_zone(c, layer.svg_path, zone)
+    elif layer.image:
+        _draw_raster_in_zone(c, layer.image, zone, transparent=True)
+
+
+def _build_gang_pdf(
+    per_design: List[dict],
+    zones:      List[_GangZone],
+    page_w:     float,
+    page_h:     float,
+) -> Tuple[bytes, int]:
+    """
+    Assemble the gang-sheet PDF.
+
+    For each physical sheet:
+      Pages 1..max_layers  — layer at that position for every design on the sheet.
+                             Designs with fewer layers show an empty zone (reg marks
+                             only) for the remainder — this is correct behaviour.
+      Final page           — composite preview for every design on the sheet.
+    """
+    out        = BytesIO()
+    c          = pdf_canvas.Canvas(out, pagesize=(page_w, page_h))
+    n_sheets   = max(z.sheet_idx for z in zones) + 1 if zones else 0
+    page_count = 0
+
+    for si in range(n_sheets):
+        sheet_zones = [z for z in zones if z.sheet_idx == si]
+        if not sheet_zones:
+            continue
+        max_layers = max(len(per_design[z.design_idx]["layers"]) for z in sheet_zones)
+
+        for layer_pos in range(max_layers):
+            for zone in sheet_zones:
+                d = per_design[zone.design_idx]
+                _draw_zone_reg_marks(c, zone, cmyk=True)
+                if layer_pos < len(d["layers"]):
+                    _draw_layer_in_zone(c, d["layers"][layer_pos], zone)
+            c.showPage()
+            page_count += 1
+
+        for zone in sheet_zones:
+            d = per_design[zone.design_idx]
+            _draw_zone_reg_marks(c, zone, cmyk=False)
+            _draw_raster_in_zone(c, d["composite"], zone)
+        c.showPage()
+        page_count += 1
+
+    c.save()
+    return out.getvalue(), page_count
+
+
+# ---------------------------------------------------------------------------
+# Public API — gang sheet
+# ---------------------------------------------------------------------------
+
+def generate_gang_sheet_pdf(
+    input_paths: List[str],
+    output_path: Optional[str] = None,
+    max_colors:  int   = 4,
+    sheet_size:  str   = "auto",
+    orientation: str   = "auto",
+    spacing_in:  float = 0.25,
+    margin_in:   float = 0.40,
+) -> Tuple[bytes, int]:
+    """
+    Separate multiple artwork files and compose them onto gang-sheet PDFs.
+
+    Each design is processed independently with the standard separation pipeline.
+    Zones are arranged via row-based bin-packing (left→right, top→bottom).
+    Pages are ordered by LAYER POSITION so every design on a sheet shares the
+    same film per color — which is what makes a gang sheet useful for production.
+
+    Args:
+        input_paths:  PNG / JPG / PDF / SVG artwork files.
+        output_path:  Optional path to also write the PDF to disk.
+        max_colors:   Per-design ink color limit (default 4).
+        sheet_size:   "auto" (13"×19" super-B) or a named size (A3/A4/Letter…).
+        orientation:  "auto", "portrait", or "landscape".
+        spacing_in:   Gap between zones, inches (default 0.25).
+        margin_in:    Sheet margin, inches (default 0.40).
+
+    Returns:
+        (pdf_bytes, page_count)
+    """
+    input_paths = [str(p) for p in input_paths]
+    for p in input_paths:
+        if not os.path.isfile(p):
+            raise FileNotFoundError(p)
+    if not input_paths:
+        raise ValueError("At least one design file required")
+
+    sheet_size  = sheet_size.lower()
+    orientation = orientation.lower()
+    if orientation not in ("auto", "portrait", "landscape"):
+        raise ValueError(f"orientation must be auto/portrait/landscape, got: {orientation!r}")
+    if sheet_size not in _NAMED_PAGE_SIZES and sheet_size != "auto":
+        raise ValueError(
+            f"sheet_size must be 'auto' or one of {sorted(_NAMED_PAGE_SIZES)}, "
+            f"got: {sheet_size!r}"
+        )
+
+    with tempfile.TemporaryDirectory() as workdir:
+        per_design: List[dict] = []
+        for d_idx, ipath in enumerate(input_paths):
+            d_work = os.path.join(workdir, f"d{d_idx}")
+            os.makedirs(d_work)
+            rgb    = _load_as_rgb_array(ipath, d_work)
+            paper, masks, inks = _separate_colors(rgb, max_colors=max_colors)
+            layers = _create_layers(rgb, paper, masks, inks, d_work) if inks else []
+            comp   = _build_composite_on_white(rgb, paper, masks, inks)
+            per_design.append({
+                "size":      (rgb.shape[1], rgb.shape[0]),
+                "layers":    layers,
+                "composite": comp,
+            })
+
+        if sheet_size == "auto":
+            page_w, page_h = 13.0 * inch, 19.0 * inch   # 13"×19" super-B
+        else:
+            page_w, page_h = _NAMED_PAGE_SIZES[sheet_size]
+
+        if orientation == "landscape" and page_h > page_w:
+            page_w, page_h = page_h, page_w
+        elif orientation == "portrait" and page_w > page_h:
+            page_w, page_h = page_h, page_w
+
+        margin  = margin_in  * inch
+        spacing = spacing_in * inch
+
+        zones = _compute_gang_layout(
+            [d["size"] for d in per_design], page_w, page_h, margin, spacing
+        )
+        pdf_bytes, page_count = _build_gang_pdf(per_design, zones, page_w, page_h)
+
+    if output_path:
+        Path(output_path).write_bytes(pdf_bytes)
+    return pdf_bytes, page_count
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
